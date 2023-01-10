@@ -1,0 +1,174 @@
+---
+title: "Introducing Perf Bisect"
+date: 2022-12-06T00:00:00Z
+categories: ['performance', 'benchmarking', 'methodology']
+summary: 'Learn how to quickly identify which commit caused a performance regression'
+image: 'perf_bisect_header.jpeg'
+related: ['']
+authors: 
+ - John O'Hara
+---
+
+Perf Bisect uses exsiting performance automation tools to provide a repeatable, reliable methodology to identify the root cause of performance regressions in complex software projects
+
+== What is The Performance Regression Problem?
+
+Performance is a wide a varied subject. Performance is subjective, can be dependent on runtime environment and regressions come in many shapes and sizes. 
+
+It is often impractical to test all performance characteristics of every change to a code base. Functional changes can be easily tested as part of a CI environment, where functional Unit tests and integration tests are designed to reduce to a PASS/FAIL outcome, and is independent of the environemnt the tests are executed in. This allows developers to design functional tests that can be run locally be engineers and integrated into CI environments.  Functional Quality is often integrated into the development pipeline. 
+
+=== What about Performance Tests?
+
+Performance characteristics are usually dependent on environment, configuration and workload.  This is especially true when developing frameworks that users depend on to empower their applications.  There are many different types of performance tests, including, but not limited to; load testing, stress testing, soak testing, resource utilization, scalability testing etc.
+
+Performance tests are often sensitive to environment variables and requires dedicated environemnts to ensure repeatable, reliable measurements. 
+
+Given the combitorial explosion of different factors of environment, configuration, workloads and types of performance tests, performance testing often occurs in parrallel, but disconnected from the development workflow.  Performance tests can be run nightly, weekly or during a product build and release process.
+
+=== What happens when you find a performance regression? 
+
+When you discover a regression in a key metric that you monitor for performance between builds and releases, what happens?  In a typical scenario, engineers attempt to determine what caused the regression.  This can involve profiling, code reviews, consulting experts and generally resembles a scientific experiment trying to expose the root cause of the regression.
+
+Sometimes this investigation quickly finds an obvious source; but more often than not the exploritory phase is a labour intensive, frustrating experience as multiple engineers test their individual theories about what could be the root cause (or causes). 
+
+== Intrdoducing Perf-Bisect
+
+=== What is Perf-Bisect?
+
+
+Perf bisect is a tools that uses a number of existing tools to automatically 
+
+
+[mermaid, perf-bisect-diag, svg]
+----
+flowchart LR
+    start((start)) --> checkout(checkout project)
+    checkout --> initbisect(initialize bisect)
+    subgraph loop[Perf Bisect Loop]
+        startLoop((start loop)) -->
+        gitCheckout(git checkout) --> perfRun(run performance test)
+        perfRun --> perfMetricValidate(Valifate Performance Metric)
+        perfMetricValidate --> gitMark(bisect mark commit good/bad)
+        gitMark --> nextGitCommit --> gitCheckout
+    end
+    initbisect --> loop
+    loop --> reportCommit(report commit)
+----
+
+== Use Case
+
+Performance test is executed by https://github.com/Hyperfoil/qDup/blob/master/docs/userguide.adoc[qDup].  An example qDup script is below;
+
+[source, java]
+----
+package org.acme.hibernate.orm.panache;
+
+import javax.persistence.Cacheable;
+import javax.persistence.Column;
+import javax.persistence.Entity;
+
+import io.quarkus.hibernate.reactive.panache.PanacheEntity;  // <1>
+
+@Entity
+@Cacheable
+public class Fruit extends PanacheEntity {
+
+	 @Column(length = 40, unique = true)
+	 public String name;
+
+}
+----
+<1> Make sure you import the reactive variant of `PanacheEntity`.
+
+
+[source, yaml]
+----
+scripts:
+
+  setup-quarkus: // <1>
+    - sh: mkdir -p /tmp/perf-bisect/quarkus
+    - sh: cd /tmp/perf-bisect/quarkus
+    - sh: if [ ! -d "quarkus" ]; then git clone ${{QUARKUS_REPO_URL}}; fi
+    - sh: cd ./quarkus
+    - sh: git fetch --all
+    - sh: git checkout -f ${{QUARKUS_COMMIT}}
+    - sh: mvn clean install -T C1 -Dquickly
+      then:
+      - regex: BUILD FAILURE
+        then:
+        - abort: Quarkus Failed to Build
+
+  setup-quarkus-qe-start-stop:
+    - sh: mkdir -p /tmp/perf-bisect/quarkus
+    - sh: if [ ! -d "quarkus-startstop" ]; then git clone ${{START_STOP_REPO_URL}}; fi
+    - sh: cd ./quarkus-startstop
+    - sh: git fetch --all
+    - sh: git checkout -f ${{START_STOP_BRANCH}}
+
+  run-test:
+    - sh: cd /tmp/perf-bisect/quarkus/quarkus-startstop
+    - sh: mvn clean test -Ptestsuite -Dtest=StartStopTest#fullMicroProfileNative -Dquarkus.version=999-SNAPSHOT
+      then:
+      - regex: BUILD FAILURE
+        then:
+        - abort: Start Stop tests failed
+    - sh: awk -F',' '(NR>1){sum+=$7; ++n} END { print sum/n }' < testsuite/target/archived-logs/io.quarkus.ts.startstop.StartStopTest/fullMicroProfileNative/measurements.csv > result.out
+    - queue-download: ./result.out
+
+hosts:
+  local : ${{USER}}@${{HOST}}
+roles:
+  run-hello-qdup:
+    hosts:
+      - local
+    setup-scripts:
+      - setup-quarkus
+      - setup-quarkus-qe-start-stop
+    run-scripts:
+      - run-test
+states:
+  QUARKUS_REPO_URL: git@github.com:quarkusio/quarkus.git
+  QUARKUS_COMMIT: origin/main
+
+  START_STOP_REPO_URL: git@github.com:quarkus-qe/quarkus-startstop.git
+  START_STOP_BRANCH: disable_cleanup_topic.1122.minor-tweaks.2.7-22.3
+  
+  USER: johara
+  HOST: localhost
+----
+<1> Some random script
+
+=== Configuration
+
+{{< highlight json>}}
+{
+    "project": {
+      "repoUrl": "https://github.com/quarkusio/quarkus.git",
+      "badCommit": "bc5fb5a3a05dd4dd9c45dceaec84d3afd60dbf58",
+      "goodCommit": "3f94ebd676bb9c9804220ad8fce7f71e5ce1dee4" 
+    },
+    "validator": {
+      "ScalarFileLimitValidator": {
+        "filePath": "localhost/result.out",
+        "limit": "68000.0"
+      }
+    },
+    "qDup": {
+      "scriptFile": "quarkus-perf-bisect.yaml",
+      "utilityScripts": [
+        "core-scripts/util.yaml"
+      ],
+      "repoUrl": "https://github.com/johnaohara/perf-bisect-qDup-scripts.git",
+      "branch": "*/main",
+      "credentials": {
+        "user": "",
+        "pword": ""
+      },
+      "commitParam": "QUARKUS_COMMIT",
+      "params": {
+        "HOST": "localhost",
+        "USER": "johara"
+      }
+    }
+  }
+{{< / highlight >}}
